@@ -1,10 +1,12 @@
 """Planner module for generating execution plans."""
 import json
+import logging
 from typing import List, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStep, PlanStatus
 from config.llm_config import LLMConfig
+from utils.logger import log_llm_interaction
 
 
 class Planner:
@@ -19,6 +21,7 @@ class Planner:
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
         )
+        self.logger = logging.getLogger("code_agent")
 
     async def create_plan(self, state: AgentState) -> AgentState:
         """Create initial plan from user request."""
@@ -64,6 +67,15 @@ Be specific and break down complex tasks into smaller steps."""
         ]
 
         response = await self.llm.ainvoke(messages)
+
+        # Log LLM interaction
+        log_llm_interaction(
+            self.logger,
+            "planner",
+            messages,
+            response.content
+        )
+
         plan_json = self._extract_json(response.content)
 
         # Parse plan steps

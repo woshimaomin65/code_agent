@@ -112,6 +112,74 @@ class AgentState(BaseModel):
                         self.failed_steps.append(step_id)
                 break
 
+    def get_execution_summary(self, max_steps: int = 5) -> str:
+        """Get a summary of recent execution results for reflection.
+
+        Args:
+            max_steps: Maximum number of recent steps to include in detail
+        """
+        if not self.plan:
+            return "No execution history yet."
+
+        lines = ["📊 Execution History:"]
+
+        # Get recent steps (last max_steps)
+        recent_steps = self.plan[-max_steps:] if len(self.plan) > max_steps else self.plan
+        older_steps = self.plan[:-max_steps] if len(self.plan) > max_steps else []
+
+        # Summarize older steps
+        if older_steps:
+            completed = sum(1 for s in older_steps if s.status == PlanStatus.COMPLETED)
+            failed = sum(1 for s in older_steps if s.status == PlanStatus.FAILED)
+            lines.append(f"\n[Earlier steps: {completed} completed, {failed} failed]")
+
+        # Detail recent steps
+        lines.append("\nRecent steps:")
+        for step in recent_steps:
+            status_icon = {
+                PlanStatus.PENDING: "⏳",
+                PlanStatus.IN_PROGRESS: "🔄",
+                PlanStatus.COMPLETED: "✅",
+                PlanStatus.FAILED: "❌",
+                PlanStatus.SKIPPED: "⏭️",
+            }[step.status]
+
+            lines.append(f"\n{status_icon} Step {step.id}: {step.description}")
+            lines.append(f"   Tool: {step.tool or 'none'}")
+
+            if step.status == PlanStatus.COMPLETED and step.result:
+                result_preview = step.result[:150] + "..." if len(step.result) > 150 else step.result
+                lines.append(f"   ✓ Result: {result_preview}")
+            elif step.status == PlanStatus.FAILED and step.error:
+                lines.append(f"   ✗ Error: {step.error}")
+
+        return "\n".join(lines)
+
+    def compact_messages(self, max_messages: int = 10) -> None:
+        """Compact message history to prevent context explosion.
+
+        Keeps the most recent messages and summarizes older ones.
+
+        Args:
+            max_messages: Maximum number of messages to keep in detail
+        """
+        if len(self.messages) <= max_messages:
+            return
+
+        # Keep recent messages
+        recent_messages = self.messages[-max_messages:]
+        older_messages = self.messages[:-max_messages]
+
+        # Create summary of older messages
+        summary = {
+            "role": "system",
+            "content": f"[Summary of {len(older_messages)} earlier messages: "
+                      f"Discussed initial planning and early execution steps]"
+        }
+
+        # Replace with compacted version
+        self.messages = [summary] + recent_messages
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return self.model_dump()

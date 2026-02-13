@@ -86,7 +86,7 @@ Commands:
             elif command == "str_replace":
                 return await self._str_replace(path, old_str, new_str)
             elif command == "insert":
-                return await self._insert(path, insert_line, new_str)
+                return await self._insert(path, insert_line, content)
             else:
                 return ToolResult(
                     success=False,
@@ -171,7 +171,6 @@ Commands:
         """Replace string in file."""
         if not old_str:
             return ToolResult(success=False, error="old_str is required")
-
         with open(path, 'r', encoding='utf-8') as f:
             content = f.read()
 

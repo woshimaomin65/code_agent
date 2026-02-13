@@ -1,10 +1,12 @@
 """Replanner module for adjusting plans based on execution results."""
 import json
+import logging
 from typing import List, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStep, PlanStatus
 from config.llm_config import LLMConfig
+from utils.logger import log_llm_interaction
 
 
 class Replanner:
@@ -19,6 +21,7 @@ class Replanner:
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
         )
+        self.logger = logging.getLogger("code_agent")
 
     async def replan(self, state: AgentState) -> AgentState:
         """Replan based on current state and failures."""
@@ -41,26 +44,34 @@ Return a JSON object with:
 - action: "modify", "add_steps", "skip", or "alternative"
 - steps: array of new/modified steps (same format as original plan)
 
+IMPORTANT: When action is "modify", each step MUST include the "id" field to identify which step to modify.
+
 Available tools:
 1. file_editor - For file operations (view, create, copy, delete, str_replace, insert)
 2. python_executor - For executing Python code
 3. bash_executor - For executing bash commands"""
 
-        # Build context
+        # Build context with execution history for reflection
         context = f"""Original request: {state.user_request}
+
+{state.get_execution_summary(max_steps=10)}
 
 Current plan status:
 {state.get_todo_list()}
 
-Failed steps:
+Failed steps requiring attention:
 """
         for step in failed_steps:
             context += f"\nStep {step.id}: {step.description}"
             context += f"\nTool: {step.tool}"
             context += f"\nParams: {step.tool_params}"
-            context += f"\nError: {step.error}\n"
+            context += f"\nError: {step.error}"
+            if step.result:
+                context += f"\nPartial output: {step.result[:200]}"
+            context += "\n"
 
-        context += "\n\nProvide a replanning strategy to handle these failures."
+        context += "\n\nBased on the execution history and errors above, provide a replanning strategy."
+        context += "\nConsider what has already been tried and avoid repeating the same failed approaches."
 
         messages = [
             SystemMessage(content=system_prompt),
@@ -68,6 +79,15 @@ Failed steps:
         ]
 
         response = await self.llm.ainvoke(messages)
+
+        # Log LLM interaction
+        log_llm_interaction(
+            self.logger,
+            "replanner",
+            messages,
+            response.content
+        )
+
         replan_data = self._extract_json(response.content)
 
         action = replan_data.get("action", "modify")
@@ -82,6 +102,11 @@ Failed steps:
         elif action == "modify":
             # Modify failed steps
             for new_step_data in new_steps:
+                # Check if 'id' field exists
+                if "id" not in new_step_data:
+                    print(f"⚠️ Warning: Step data missing 'id' field, skipping: {new_step_data.get('description', 'unknown')}")
+                    continue
+
                 step_id = new_step_data["id"]
                 for step in state.plan:
                     if step.id == step_id:
