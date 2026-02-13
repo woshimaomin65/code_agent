@@ -22,7 +22,7 @@ def create_agent_graph(llm_config: LLMConfig) -> StateGraph:
     """Create the agent workflow graph."""
     # Initialize components
     planner = Planner(llm_config)
-    executor = Executor()
+    executor = Executor(llm_config)  # Pass llm_config for goal verification
     replanner = Replanner(llm_config)
 
     # Create graph
