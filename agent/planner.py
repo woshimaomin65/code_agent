@@ -7,7 +7,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStep, PlanStatus
 from config.llm_config import LLMConfig
 from utils.logger import invoke_llm_with_streaming
-import json
+from utils.json_extractor import JSONExtractor
 
 def js(data):
     print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
@@ -28,6 +28,7 @@ class Planner:
         )
         self.streaming = llm_config.streaming
         self.logger = logging.getLogger("code_agent")
+        self.json_extractor = JSONExtractor(self.logger)
 
     async def create_plan(self, state: AgentState) -> AgentState:
         """Create initial plan from user request."""
@@ -69,55 +70,91 @@ Example:
   }
 ]
 
-Be specific and break down complex tasks into smaller steps."""
+IMPORTANT: Return ONLY valid JSON. Do not include any explanatory text before or after the JSON array. Ensure proper JSON formatting with correct commas and no trailing commas."""
 
         user_prompt = f"User request: {state.user_request}\n\nCreate a detailed execution plan."
 
-        messages = [
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=user_prompt)
-        ]
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                messages = [
+                    SystemMessage(content=system_prompt),
+                    HumanMessage(content=user_prompt)
+                ]
 
-        # Use streaming utility with think tag handling
-        _, response_content = await invoke_llm_with_streaming(
-            self.llm,
-            messages,
-            streaming=self.streaming,
-            module="planner",
-            logger=self.logger
-        )
+                # Use streaming utility with think tag handling
+                _, response_content = await invoke_llm_with_streaming(
+                    self.llm,
+                    messages,
+                    streaming=self.streaming,
+                    module="planner",
+                    logger=self.logger
+                )
 
-        plan_json = self._extract_json(response_content)
+                plan_json = self._extract_json(response_content)
 
-        # Parse plan steps
-        plan_steps = []
-        for step_data in plan_json:
-            step = PlanStep(
-                id=step_data["id"],
-                description=step_data["description"],
-                status=PlanStatus.PENDING,
-                tool=step_data.get("tool"),
-                tool_params=step_data.get("tool_params"),
-                dependencies=step_data.get("dependencies", [])
-            )
-            plan_steps.append(step)
+                # Parse plan steps with error handling
+                plan_steps = []
+                for step_data in plan_json:
+                    try:
+                        step = PlanStep(
+                            id=step_data["id"],
+                            description=step_data["description"],
+                            status=PlanStatus.PENDING,
+                            tool=step_data.get("tool"),
+                            tool_params=step_data.get("tool_params"),
+                            dependencies=step_data.get("dependencies", [])
+                        )
+                        plan_steps.append(step)
+                    except KeyError as e:
+                        self.logger.error(f"Missing required field in step: {e}")
+                        raise ValueError(f"Invalid step structure: missing field {e}")
 
-        state.plan = plan_steps
-        state.messages.append({
-            "role": "assistant",
-            "content": f"Created plan with {len(plan_steps)} steps"
-        })
+                state.plan = plan_steps
+                state.messages.append({
+                    "role": "assistant",
+                    "content": f"Created plan with {len(plan_steps)} steps"
+                })
 
-        return state
+                return state
+
+            except (ValueError, json.JSONDecodeError) as e:
+                self.logger.warning(f"Attempt {attempt + 1}/{max_retries} failed: {e}")
+                if attempt < max_retries - 1:
+                    # Add feedback to retry prompt
+                    user_prompt = f"{user_prompt}\n\nPrevious attempt failed with error: {e}\nPlease ensure you return valid JSON with proper formatting."
+                else:
+                    # Final attempt failed
+                    error_msg = f"Failed to create plan after {max_retries} attempts: {e}"
+                    self.logger.error(error_msg)
+                    state.messages.append({
+                        "role": "assistant",
+                        "content": f"Error: {error_msg}"
+                    })
+                    raise ValueError(error_msg)
 
     def _extract_json(self, text: str) -> List[Dict[str, Any]]:
-        """Extract JSON from LLM response."""
-        # Try to find JSON array in the response
-        start = text.find('[')
-        end = text.rfind(']') + 1
+        """Extract JSON array from LLM response using shared utility."""
+        result = self.json_extractor.extract(text, expect_array=True)
 
-        if start == -1 or end == 0:
-            raise ValueError("No JSON array found in response")
+        # Additional validation for plan-specific requirements
+        if not self._validate_plan_json(result):
+            raise ValueError("JSON does not match expected plan structure")
 
-        json_str = text[start:end]
-        return json.loads(json_str)
+        return result
+
+    def _validate_plan_json(self, plan_data: List[Dict[str, Any]]) -> bool:
+        """Validate that the parsed JSON has the expected plan structure."""
+        if not isinstance(plan_data, list) or len(plan_data) == 0:
+            return False
+
+        # Check that each step has required fields
+        required_fields = ['id', 'description']
+        for step in plan_data:
+            if not isinstance(step, dict):
+                return False
+            for field in required_fields:
+                if field not in step:
+                    return False
+
+        return True

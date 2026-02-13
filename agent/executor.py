@@ -7,6 +7,7 @@ from .state import AgentState, PlanStatus
 from tools import FileEditorTool, PythonExecutorTool, BashExecutorTool
 from config.llm_config import LLMConfig
 from utils.logger import invoke_llm_with_streaming
+from utils.json_extractor import JSONExtractor
 
 
 class Executor:
@@ -32,6 +33,7 @@ class Executor:
                 **({"extra_body": llm_config.extra_body} if llm_config.extra_body else {})
             )
             self.streaming = llm_config.streaming
+            self.json_extractor = JSONExtractor(self.logger)
 
     async def _verify_goal_achievement(
         self,
@@ -100,13 +102,9 @@ Did this execution achieve the goal?"""
                 logger=self.logger
             )
 
-            # Parse response
-            import json
-            start = response_content.find('{')
-            end = response_content.rfind('}') + 1
-
-            if start != -1 and end > start:
-                result = json.loads(response_content[start:end])
+            # Parse response using shared JSON extractor
+            try:
+                result = self.json_extractor.extract(response_content, expect_array=False)
                 achieved = result.get("achieved", True)
                 reason = result.get("reason", "Verification completed")
                 confidence = result.get("confidence", "medium")
@@ -116,8 +114,9 @@ Did this execution achieve the goal?"""
                     return True, f"Low confidence: {reason}"
 
                 return achieved, reason
-            else:
+            except Exception as parse_error:
                 # Failed to parse, assume achieved
+                self.logger.debug(f"Failed to parse verification response: {parse_error}")
                 return True, "Failed to parse verification response"
 
         except Exception as e:

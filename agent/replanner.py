@@ -1,12 +1,11 @@
 """Replanner module for adjusting plans based on execution results."""
-import json
 import logging
-from typing import List, Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStep, PlanStatus
 from config.llm_config import LLMConfig
 from utils.logger import invoke_llm_with_streaming
+from utils.json_extractor import JSONExtractor
 
 
 class Replanner:
@@ -24,6 +23,7 @@ class Replanner:
         )
         self.streaming = llm_config.streaming
         self.logger = logging.getLogger("code_agent")
+        self.json_extractor = JSONExtractor(self.logger)
 
     async def replan(self, state: AgentState) -> AgentState:
         """Replan by fixing failed steps with context from surrounding steps."""
@@ -157,15 +157,8 @@ Return a JSON object with the fixed step."""
         )
 
         try:
-            # Extract JSON object (not array)
-            start = response_content.find('{')
-            end = response_content.rfind('}') + 1
-
-            if start == -1 or end == 0:
-                raise ValueError("No JSON object found in response")
-
-            json_str = response_content[start:end]
-            fixed_step_data = json.loads(json_str)
+            # Extract JSON object (not array) using shared utility
+            fixed_step_data = self.json_extractor.extract(response_content, expect_array=False)
 
             # Update the failed step in place
             for step in state.plan:
@@ -295,7 +288,8 @@ Return a JSON array of steps starting from Step {first_failed_step.id}."""
         )
 
         try:
-            new_steps_data = self._extract_json_array(response_content)
+            # Extract JSON array using shared utility
+            new_steps_data = self.json_extractor.extract(response_content, expect_array=True)
 
             # Remove all steps from the first failed step onwards
             state.plan = [s for s in state.plan if s.id < first_failed_step.id]
@@ -327,15 +321,3 @@ Return a JSON array of steps starting from Step {first_failed_step.id}."""
 
         state.needs_replan = False
         return state
-
-    def _extract_json_array(self, text: str) -> List[Dict[str, Any]]:
-        """Extract JSON array from LLM response."""
-        # Try to find JSON array in the response
-        start = text.find('[')
-        end = text.rfind(']') + 1
-
-        if start == -1 or end == 0:
-            raise ValueError("No JSON array found in response")
-
-        json_str = text[start:end]
-        return json.loads(json_str)
