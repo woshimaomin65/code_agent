@@ -1,5 +1,7 @@
 """Main entry point for the code agent."""
 import asyncio
+from prompt_toolkit import PromptSession
+from prompt_toolkit.styles import Style
 from config import LLMConfig
 from agent import AgentState, create_agent_graph
 from utils import setup_logger
@@ -26,8 +28,14 @@ async def main():
     # Create agent graph
     agent = create_agent_graph(llm_config)
 
-    # Example user request
-    user_request = input("\n📝 Enter your request: ")
+    # Custom style for prompt
+    style = Style.from_dict({
+        'prompt': '#00aa00 bold',
+    })
+
+    # Get user request with better input handling (async version)
+    session = PromptSession(style=style)
+    user_request = await session.prompt_async("📝 Enter your request: ")
 
     # Initialize state
     initial_state = AgentState(
