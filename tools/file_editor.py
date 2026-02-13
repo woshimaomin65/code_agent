@@ -13,7 +13,8 @@ class FileEditorTool(BaseTool):
         self.name = "file_editor"
         self.description = """File editor tool for viewing, creating, editing, copying, and deleting files.
 Commands:
-- view: View file or directory contents
+- view: View file or directory contents (optionally with view_range [start, end])
+- view_context: View file with context around a specific line
 - create: Create a new file with content
 - copy: Copy file or directory
 - delete: Delete file or directory
@@ -25,7 +26,7 @@ Commands:
             "properties": {
                 "command": {
                     "type": "string",
-                    "enum": ["view", "create", "copy", "delete", "str_replace", "insert"],
+                    "enum": ["view", "view_context", "create", "copy", "delete", "str_replace", "insert"],
                     "description": "Command to execute"
                 },
                 "path": {
@@ -56,6 +57,14 @@ Commands:
                     "type": "array",
                     "items": {"type": "integer"},
                     "description": "Line range for view command [start, end]"
+                },
+                "center_line": {
+                    "type": "integer",
+                    "description": "Center line number for view_context command"
+                },
+                "context_lines": {
+                    "type": "integer",
+                    "description": "Number of lines before and after center_line (default: 20)"
                 }
             },
             "required": ["command", "path"]
@@ -63,7 +72,7 @@ Commands:
 
     async def execute(
         self,
-        command: Literal["view", "create", "copy", "delete", "str_replace", "insert"],
+        command: Literal["view", "view_context", "create", "copy", "delete", "str_replace", "insert"],
         path: str,
         content: Optional[str] = None,
         target_path: Optional[str] = None,
@@ -71,12 +80,16 @@ Commands:
         new_str: Optional[str] = None,
         insert_line: Optional[int] = None,
         view_range: Optional[list] = None,
+        center_line: Optional[int] = None,
+        context_lines: Optional[int] = 20,
         **kwargs
     ) -> ToolResult:
         """Execute file operation command."""
         try:
             if command == "view":
                 return await self._view(path, view_range)
+            elif command == "view_context":
+                return await self._view_context(path, center_line, context_lines)
             elif command == "create":
                 return await self._create(path, content)
             elif command == "copy":
@@ -96,7 +109,12 @@ Commands:
             return ToolResult(success=False, error=str(e))
 
     async def _view(self, path: str, view_range: Optional[list] = None) -> ToolResult:
-        """View file or directory contents."""
+        """View file or directory contents.
+
+        Args:
+            path: Path to file or directory
+            view_range: Optional [start_line, end_line] to view specific range (1-indexed)
+        """
         p = Path(path)
         if not p.exists():
             return ToolResult(success=False, error=f"Path does not exist: {path}")
@@ -108,15 +126,80 @@ Commands:
             return ToolResult(success=True, output=output)
         else:
             with open(path, 'r', encoding='utf-8') as f:
-                lines = f.readlines()
+                all_lines = f.readlines()
+
+            total_lines = len(all_lines)
 
             if view_range:
                 start, end = view_range
-                lines = lines[start-1:end] if end != -1 else lines[start-1:]
+                # Ensure valid range
+                start = max(1, min(start, total_lines))
+                end = min(total_lines, end) if end != -1 else total_lines
 
-            numbered_lines = [f"{i+1:6}\t{line.rstrip()}" for i, line in enumerate(lines)]
-            output = "\n".join(numbered_lines)
+                # Extract the range (convert to 0-indexed for slicing)
+                lines = all_lines[start-1:end]
+
+                # Create output with correct line numbers
+                numbered_lines = [f"{start+i:6}\t{line.rstrip()}" for i, line in enumerate(lines)]
+                output = f"File: {path} (showing lines {start}-{end} of {total_lines})\n"
+                output += "\n".join(numbered_lines)
+            else:
+                # Show entire file
+                numbered_lines = [f"{i+1:6}\t{line.rstrip()}" for i, line in enumerate(all_lines)]
+                output = f"File: {path} ({total_lines} lines)\n"
+                output += "\n".join(numbered_lines)
+
             return ToolResult(success=True, output=output)
+
+    async def _view_context(
+        self,
+        path: str,
+        center_line: Optional[int] = None,
+        context_lines: int = 20
+    ) -> ToolResult:
+        """View file with context around a specific line.
+
+        Args:
+            path: Path to file
+            center_line: Line number to center on (1-indexed)
+            context_lines: Number of lines to show before and after center_line
+
+        Returns:
+            ToolResult with file content showing the context window
+        """
+        if center_line is None:
+            return ToolResult(success=False, error="center_line is required for view_context command")
+
+        p = Path(path)
+        if not p.exists():
+            return ToolResult(success=False, error=f"Path does not exist: {path}")
+
+        if p.is_dir():
+            return ToolResult(success=False, error=f"Path is a directory, not a file: {path}")
+
+        with open(path, 'r', encoding='utf-8') as f:
+            all_lines = f.readlines()
+
+        total_lines = len(all_lines)
+
+        # Calculate the window range
+        start = max(1, center_line - context_lines)
+        end = min(total_lines, center_line + context_lines)
+
+        # Extract the range (convert to 0-indexed for slicing)
+        lines = all_lines[start-1:end]
+
+        # Create output with correct line numbers and highlight the center line
+        numbered_lines = []
+        for i, line in enumerate(lines):
+            line_num = start + i
+            prefix = ">>>" if line_num == center_line else "   "
+            numbered_lines.append(f"{prefix} {line_num:6}\t{line.rstrip()}")
+
+        output = f"File: {path} (showing lines {start}-{end} of {total_lines}, centered on line {center_line})\n"
+        output += "\n".join(numbered_lines)
+
+        return ToolResult(success=True, output=output)
 
     async def _create(self, path: str, content: Optional[str]) -> ToolResult:
         """Create a new file."""

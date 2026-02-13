@@ -6,7 +6,11 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStep, PlanStatus
 from config.llm_config import LLMConfig
-from utils.logger import log_llm_interaction
+from utils.logger import invoke_llm_with_streaming
+import json
+
+def js(data):
+    print(json.dumps(data, indent=2, ensure_ascii=False, default=str))
 
 
 class Planner:
@@ -20,7 +24,9 @@ class Planner:
             model=llm_config.model,
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
+            **({"extra_body": llm_config.extra_body} if llm_config.extra_body else {})
         )
+        self.streaming = llm_config.streaming
         self.logger = logging.getLogger("code_agent")
 
     async def create_plan(self, state: AgentState) -> AgentState:
@@ -28,9 +34,15 @@ class Planner:
         system_prompt = """You are a planning assistant. Given a user request, create a detailed step-by-step plan.
 
 Available tools:
-1. file_editor - For file operations (view, create, copy, delete, str_replace, insert)
-2. python_executor - For executing Python code
-3. bash_executor - For executing bash commands
+1. file_editor - For file operations
+   - view: View entire file or with range {"command": "view", "path": "/path", "view_range": [start, end]}
+   - view_context: View file with context around a line {"command": "view_context", "path": "/path", "center_line": 50, "context_lines": 20}
+   - create: Create new file {"command": "create", "path": "/path", "content": "..."}
+   - str_replace: Replace string {"command": "str_replace", "path": "/path", "old_str": "...", "new_str": "..."}
+   - insert: Insert at line {"command": "insert", "path": "/path", "insert_line": 10, "content": "..."}
+   - delete: Delete file {"command": "delete", "path": "/path"}
+2. python_executor - For executing Python code {"code": "python code"}
+3. bash_executor - For executing bash commands {"command": "bash command"}
 
 Return a JSON array of steps, each with:
 - id: step number (starting from 1)
@@ -66,17 +78,16 @@ Be specific and break down complex tasks into smaller steps."""
             HumanMessage(content=user_prompt)
         ]
 
-        response = await self.llm.ainvoke(messages)
-
-        # Log LLM interaction
-        log_llm_interaction(
-            self.logger,
-            "planner",
+        # Use streaming utility with think tag handling
+        _, response_content = await invoke_llm_with_streaming(
+            self.llm,
             messages,
-            response.content
+            streaming=self.streaming,
+            module="planner",
+            logger=self.logger
         )
 
-        plan_json = self._extract_json(response.content)
+        plan_json = self._extract_json(response_content)
 
         # Parse plan steps
         plan_steps = []

@@ -1,5 +1,5 @@
 """LLM Configuration."""
-from typing import Literal
+from typing import Literal, Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 
@@ -32,6 +32,14 @@ class LLMConfig(BaseModel):
         default=4096,
         gt=0,
         description="Maximum tokens to generate"
+    )
+    extra_body: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Extra parameters to pass to the LLM API"
+    )
+    streaming: bool = Field(
+        default=False,
+        description="Enable streaming mode for LLM responses"
     )
 
     @classmethod

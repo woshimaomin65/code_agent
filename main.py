@@ -13,14 +13,26 @@ async def main():
     logger = setup_logger()
 
     # Load LLM config
+    #llm_config = LLMConfig(
+    #    api_base="https://api.deepseek.com",
+    #    api_key="sk-13b88e3a2e2d44398eb928e84dfef13a",
+    #    model="deepseek-chat",
+    #    response_format="text",
+    #    temperature=0.7,
+    #    max_tokens=30000
+    #)
     llm_config = LLMConfig(
-        api_base="https://api.deepseek.com",
-        api_key="sk-13b88e3a2e2d44398eb928e84dfef13a",
-        model="deepseek-chat",
+        api_base="http://192.168.18.201:30847/v1",
+        api_key="anything",
+        model="/data/meiyeai/model-server-qwen3/models/qwen3_32b_awq",
         response_format="text",
         temperature=0.7,
-        max_tokens=4096
-    )
+        max_tokens=30000,
+        streaming=True,
+        extra_body={
+        "chat_template_kwargs": {"enable_thinking": True},
+        "separate_reasoning": True
+    })
 
     logger.info("🚀 Starting Code Agent")
     logger.info(f"Using model: {llm_config.model}")

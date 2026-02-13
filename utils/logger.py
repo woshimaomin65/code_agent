@@ -1,7 +1,8 @@
 """Logging utilities."""
 import logging
 import sys
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Tuple
+from langchain_openai import ChatOpenAI
 
 
 def setup_logger(
@@ -80,3 +81,84 @@ def log_llm_interaction(
         logger.info(f"  {response}")
 
     logger.info(f"{'='*60}\n")
+
+
+def strip_think_tags(content: str) -> str:
+    """Remove <think>...</think> tags from content.
+
+    Args:
+        content: Text that may contain think tags
+
+    Returns:
+        Content with think tags removed
+    """
+    if '<think>' in content and '</think>' in content:
+        # Remove everything from <think> to </think>
+        content = content.rsplit('</think>', 1)[1].strip()
+    return content
+
+
+async def invoke_llm_with_streaming(
+    llm: ChatOpenAI,
+    messages: List[Any],
+    streaming: bool = False,
+    module: str = "llm",
+    logger: Optional[logging.Logger] = None
+) -> Tuple[str, str]:
+    """Invoke LLM with optional streaming and think tag handling.
+
+    Args:
+        llm: ChatOpenAI instance
+        messages: List of messages to send
+        streaming: Whether to use streaming mode
+        module: Module name for logging
+        logger: Logger instance for logging interactions
+
+    Returns:
+        Tuple of (raw_content, cleaned_content) where cleaned_content has think tags removed
+    """
+    if streaming:
+        # Streaming mode
+        print(f"\n{'='*60}")
+        print(f"🤖 {module.upper()} - Streaming Response")
+        print(f"{'='*60}")
+
+        full_content = ""
+        async for chunk in llm.astream(messages):
+            if hasattr(chunk, 'content') and chunk.content:
+                print(chunk.content, end='', flush=True)
+                full_content += chunk.content
+
+        print(f"\n{'='*60}\n")
+
+        # Strip think tags from final content
+        cleaned_content = strip_think_tags(full_content)
+
+        # Log the interaction
+        if logger:
+            log_llm_interaction(
+                logger,
+                module,
+                messages,
+                cleaned_content,
+                truncate=500
+            )
+
+        return full_content, cleaned_content
+    else:
+        # Non-streaming mode
+        response = await llm.ainvoke(messages)
+        raw_content = response.content
+        cleaned_content = strip_think_tags(raw_content)
+
+        # Log the interaction
+        if logger:
+            log_llm_interaction(
+                logger,
+                module,
+                messages,
+                cleaned_content,
+                truncate=500
+            )
+
+        return raw_content, cleaned_content

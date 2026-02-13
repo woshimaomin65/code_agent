@@ -6,7 +6,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStatus
 from tools import FileEditorTool, PythonExecutorTool, BashExecutorTool
 from config.llm_config import LLMConfig
-from utils.logger import log_llm_interaction
+from utils.logger import invoke_llm_with_streaming
 
 
 class Executor:
@@ -20,6 +20,7 @@ class Executor:
             "bash_executor": BashExecutorTool(),
         }
         self.llm = None
+        self.streaming = False
         self.logger = logging.getLogger("code_agent")
         if llm_config:
             self.llm = ChatOpenAI(
@@ -28,7 +29,9 @@ class Executor:
                 model=llm_config.model,
                 temperature=0.3,  # Lower temperature for verification
                 max_tokens=500,
+                **({"extra_body": llm_config.extra_body} if llm_config.extra_body else {})
             )
+            self.streaming = llm_config.streaming
 
     async def _verify_goal_achievement(
         self,
@@ -78,7 +81,7 @@ Tool used: {tool_name}
 Tool parameters: {tool_params}
 
 Execution output:
-{execution_output[:500] if execution_output else "No output"}
+{execution_output[:5000] if execution_output else "No output"}
 
 Did this execution achieve the goal?"""
 
@@ -88,25 +91,22 @@ Did this execution achieve the goal?"""
                 HumanMessage(content=user_prompt)
             ]
 
-            response = await self.llm.ainvoke(messages)
-
-            # Log verification interaction
-            log_llm_interaction(
-                self.logger,
-                "goal_verifier",
+            # Use streaming utility with think tag handling
+            _, response_content = await invoke_llm_with_streaming(
+                self.llm,
                 messages,
-                response.content,
-                truncate=300
+                streaming=self.streaming,
+                module="goal_verifier",
+                logger=self.logger
             )
 
             # Parse response
             import json
-            content = response.content
-            start = content.find('{')
-            end = content.rfind('}') + 1
+            start = response_content.find('{')
+            end = response_content.rfind('}') + 1
 
             if start != -1 and end > start:
-                result = json.loads(content[start:end])
+                result = json.loads(response_content[start:end])
                 achieved = result.get("achieved", True)
                 reason = result.get("reason", "Verification completed")
                 confidence = result.get("confidence", "medium")
@@ -184,7 +184,7 @@ Did this execution achieve the goal?"""
                             )
                             print(f"✅ Step {next_step.id} completed")
                             if result.output:
-                                print(f"Output: {result.output[:200]}...")
+                                print(f"Output: {result.output[:2000]}...")
                             print(f"✓ Verification: {verification_reason}")
 
                             # Add success to message history for context
@@ -206,7 +206,7 @@ Did this execution achieve the goal?"""
                             # Add to message history
                             state.messages.append({
                                 "role": "assistant",
-                                "content": f"Step {next_step.id} goal not achieved: {next_step.description}\nTool output: {result.output[:200] if result.output else 'No output'}\nVerification failed: {verification_reason}"
+                                "content": f"Step {next_step.id} goal not achieved: {next_step.description}\nTool output: {result.output[:2000] if result.output else 'No output'}\nVerification failed: {verification_reason}"
                             })
                     else:
                         # Tool execution failed

@@ -6,7 +6,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStep, PlanStatus
 from config.llm_config import LLMConfig
-from utils.logger import log_llm_interaction
+from utils.logger import invoke_llm_with_streaming
 
 
 class Replanner:
@@ -20,11 +20,13 @@ class Replanner:
             model=llm_config.model,
             temperature=llm_config.temperature,
             max_tokens=llm_config.max_tokens,
+            **({"extra_body": llm_config.extra_body} if llm_config.extra_body else {})
         )
+        self.streaming = llm_config.streaming
         self.logger = logging.getLogger("code_agent")
 
     async def replan(self, state: AgentState) -> AgentState:
-        """Replan based on current state and failures."""
+        """Replan from the first failed step onwards, regenerating all remaining steps."""
         # Get failed steps
         failed_steps = [step for step in state.plan if step.status == PlanStatus.FAILED]
 
@@ -32,143 +34,146 @@ class Replanner:
             state.needs_replan = False
             return state
 
-        system_prompt = """You are a replanning assistant. Given a failed execution step, adjust the plan.
+        # Find the first failed step
+        first_failed_step = min(failed_steps, key=lambda s: s.id)
 
-You can:
-1. Modify the failed step with corrected parameters
-2. Add new steps before or after the failed step
-3. Skip the failed step if it's not critical
-4. Add alternative approaches
+        # Get completed steps (keep these as-is)
+        completed_steps = [step for step in state.plan if step.status == PlanStatus.COMPLETED and step.id < first_failed_step.id]
 
-Return a JSON object with:
-- action: "modify", "add_steps", "skip", or "alternative"
-- steps: array of new/modified steps (same format as original plan)
+        system_prompt = """You are a replanning assistant. Given a failed execution and execution history, regenerate the plan from the failure point onwards.
 
-IMPORTANT: When action is "modify", each step MUST include the "id" field to identify which step to modify.
+Your task:
+1. Analyze what went wrong and why
+2. Learn from the execution history to avoid repeating mistakes
+3. Generate a NEW complete plan starting from the failed step
+4. Consider what has already been completed successfully
+
+Return a JSON array of steps (starting from the failed step onwards):
+[
+  {
+    "id": <step_number>,
+    "description": "what to do",
+    "tool": "tool_name",
+    "tool_params": {"param": "value"},
+    "dependencies": []
+  },
+  ...
+]
 
 Available tools:
-1. file_editor - For file operations (view, create, copy, delete, str_replace, insert)
-2. python_executor - For executing Python code
-3. bash_executor - For executing bash commands"""
+1. file_editor - For file operations
+   - view: View entire file or with range {"command": "view", "path": "/path", "view_range": [start, end]}
+   - view_context: View file with context around a line {"command": "view_context", "path": "/path", "center_line": 50, "context_lines": 20}
+   - create: Create new file {"command": "create", "path": "/path", "content": "..."}
+   - str_replace: Replace string {"command": "str_replace", "path": "/path", "old_str": "...", "new_str": "..."}
+   - insert: Insert at line {"command": "insert", "path": "/path", "insert_line": 10, "content": "..."}
+   - delete: Delete file {"command": "delete", "path": "/path"}
 
-        # Build context with execution history for reflection
+2. python_executor - For executing Python code
+   - {"code": "python code to execute"}
+
+3. bash_executor - For executing bash commands
+   - {"command": "bash command"}
+
+CRITICAL:
+- For file_editor insert command, you MUST provide "insert_line" parameter (line number where to insert)
+- Analyze the error message carefully to understand what went wrong
+- Don't repeat the same mistake that caused the failure"""
+
+        # Build comprehensive context
         context = f"""Original request: {state.user_request}
 
-{state.get_execution_summary(max_steps=10)}
+=== EXECUTION HISTORY ===
+{state.get_execution_summary(max_steps=15)}
 
-Current plan status:
-{state.get_todo_list()}
-
-Failed steps requiring attention:
+=== COMPLETED STEPS (Keep these, don't regenerate) ===
 """
-        for step in failed_steps:
-            context += f"\nStep {step.id}: {step.description}"
-            context += f"\nTool: {step.tool}"
-            context += f"\nParams: {step.tool_params}"
-            context += f"\nError: {step.error}"
-            if step.result:
-                context += f"\nPartial output: {step.result[:200]}"
-            context += "\n"
+        for step in completed_steps:
+            context += f"✅ Step {step.id}: {step.description}\n"
 
-        context += "\n\nBased on the execution history and errors above, provide a replanning strategy."
-        context += "\nConsider what has already been tried and avoid repeating the same failed approaches."
+        context += f"""
+=== FAILED STEP (Start regenerating from here) ===
+Step {first_failed_step.id}: {first_failed_step.description}
+Tool: {first_failed_step.tool}
+Parameters: {first_failed_step.tool_params}
+Error: {first_failed_step.error}
+"""
+        if first_failed_step.result:
+            context += f"Partial output: {first_failed_step.result[:1000]}\n"
+
+        # Include other failed/pending steps for context
+        remaining_steps = [s for s in state.plan if s.id > first_failed_step.id]
+        if remaining_steps:
+            context += f"\n=== ORIGINAL REMAINING STEPS (for reference, will be replaced) ===\n"
+            for step in remaining_steps[:5]:  # Show first 5 for context
+                context += f"Step {step.id}: {step.description}\n"
+
+        context += f"""
+=== YOUR TASK ===
+Regenerate the plan starting from Step {first_failed_step.id} onwards.
+- Fix the error that caused Step {first_failed_step.id} to fail
+- Continue with the remaining steps needed to complete the original request
+- Learn from the execution history to avoid repeating mistakes
+- Ensure all tool parameters are correct and complete
+
+Return a JSON array of steps starting from Step {first_failed_step.id}."""
 
         messages = [
             SystemMessage(content=system_prompt),
             HumanMessage(content=context)
         ]
 
-        response = await self.llm.ainvoke(messages)
-
-        # Log LLM interaction
-        log_llm_interaction(
-            self.logger,
-            "replanner",
+        # Use streaming utility with think tag handling
+        _, response_content = await invoke_llm_with_streaming(
+            self.llm,
             messages,
-            response.content
+            streaming=self.streaming,
+            module="replanner",
+            logger=self.logger
         )
 
-        replan_data = self._extract_json(response.content)
+        try:
+            new_steps_data = self._extract_json_array(response_content)
 
-        action = replan_data.get("action", "modify")
-        new_steps = replan_data.get("steps", [])
+            # Remove all steps from the first failed step onwards
+            state.plan = [s for s in state.plan if s.id < first_failed_step.id]
 
-        if action == "skip":
-            # Skip failed steps
-            for step in failed_steps:
-                state.update_step_status(step.id, PlanStatus.SKIPPED)
-            print(f"⏭️ Skipped {len(failed_steps)} failed steps")
-
-        elif action == "modify":
-            # Modify failed steps
-            for new_step_data in new_steps:
-                # Check if 'id' field exists
-                if "id" not in new_step_data:
-                    print(f"⚠️ Warning: Step data missing 'id' field, skipping: {new_step_data.get('description', 'unknown')}")
-                    continue
-
-                step_id = new_step_data["id"]
-                for step in state.plan:
-                    if step.id == step_id:
-                        step.description = new_step_data.get("description", step.description)
-                        step.tool = new_step_data.get("tool", step.tool)
-                        step.tool_params = new_step_data.get("tool_params", step.tool_params)
-                        step.status = PlanStatus.PENDING
-                        step.error = None
-                        # Remove from failed steps
-                        if step_id in state.failed_steps:
-                            state.failed_steps.remove(step_id)
-                        print(f"🔄 Modified Step {step_id}")
-                        break
-
-        elif action == "add_steps":
-            # Add new steps
-            max_id = max([s.id for s in state.plan]) if state.plan else 0
-            for i, new_step_data in enumerate(new_steps):
+            # Add the new regenerated steps
+            for step_data in new_steps_data:
                 new_step = PlanStep(
-                    id=max_id + i + 1,
-                    description=new_step_data["description"],
+                    id=step_data["id"],
+                    description=step_data["description"],
                     status=PlanStatus.PENDING,
-                    tool=new_step_data.get("tool"),
-                    tool_params=new_step_data.get("tool_params"),
-                    dependencies=new_step_data.get("dependencies", [])
+                    tool=step_data.get("tool"),
+                    tool_params=step_data.get("tool_params"),
+                    dependencies=step_data.get("dependencies", [])
                 )
                 state.plan.append(new_step)
-                print(f"➕ Added Step {new_step.id}: {new_step.description}")
+                print(f"🔄 Regenerated Step {new_step.id}: {new_step.description}")
 
-        elif action == "alternative":
-            # Replace failed steps with alternatives
-            for step in failed_steps:
-                state.update_step_status(step.id, PlanStatus.SKIPPED)
+            # Clear failed steps tracking
+            state.failed_steps = []
 
-            max_id = max([s.id for s in state.plan]) if state.plan else 0
-            for i, new_step_data in enumerate(new_steps):
-                new_step = PlanStep(
-                    id=max_id + i + 1,
-                    description=new_step_data["description"],
-                    status=PlanStatus.PENDING,
-                    tool=new_step_data.get("tool"),
-                    tool_params=new_step_data.get("tool_params"),
-                    dependencies=new_step_data.get("dependencies", [])
-                )
-                state.plan.append(new_step)
-                print(f"🔀 Alternative Step {new_step.id}: {new_step.description}")
+            print(f"\n✨ Replanned from Step {first_failed_step.id} onwards ({len(new_steps_data)} steps)")
+
+        except Exception as e:
+            self.logger.error(f"Failed to parse replan response: {str(e)}")
+            # Fallback: just reset the failed step to pending
+            first_failed_step.status = PlanStatus.PENDING
+            first_failed_step.error = None
+            print(f"⚠️ Replan parsing failed, retrying failed step as-is")
 
         state.needs_replan = False
         return state
 
-    def _extract_json(self, text: str) -> Dict[str, Any]:
-        """Extract JSON from LLM response."""
-        # Try to find JSON object in the response
-        start = text.find('{')
-        end = text.rfind('}') + 1
+    def _extract_json_array(self, text: str) -> List[Dict[str, Any]]:
+        """Extract JSON array from LLM response."""
+        # Try to find JSON array in the response
+        start = text.find('[')
+        end = text.rfind(']') + 1
 
         if start == -1 or end == 0:
-            # Fallback: return default action
-            return {"action": "skip", "steps": []}
+            raise ValueError("No JSON array found in response")
 
         json_str = text[start:end]
-        try:
-            return json.loads(json_str)
-        except json.JSONDecodeError:
-            return {"action": "skip", "steps": []}
+        return json.loads(json_str)
