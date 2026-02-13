@@ -26,7 +26,7 @@ class Replanner:
         self.logger = logging.getLogger("code_agent")
 
     async def replan(self, state: AgentState) -> AgentState:
-        """Replan from the first failed step onwards, regenerating all remaining steps."""
+        """Replan by fixing failed steps with context from surrounding steps."""
         # Get failed steps
         failed_steps = [step for step in state.plan if step.status == PlanStatus.FAILED]
 
@@ -37,6 +37,168 @@ class Replanner:
         # Find the first failed step
         first_failed_step = min(failed_steps, key=lambda s: s.id)
 
+        # Check if this is a repeated failure (same step failed multiple times)
+        # If so, do a full replan instead of local fix
+        if state.iteration_count > 5 and first_failed_step.id in state.failed_steps:
+            print(f"⚠️ Step {first_failed_step.id} failed multiple times, doing full replan")
+            return await self._full_replan(state, first_failed_step)
+
+        # Try local fix: modify just the failed step with context
+        print(f"🔧 Attempting local fix for Step {first_failed_step.id}")
+        return await self._local_fix(state, first_failed_step)
+
+    async def _local_fix(
+        self,
+        state: AgentState,
+        failed_step: PlanStep,
+        context_steps: int = 3
+    ) -> AgentState:
+        """Fix a failed step by modifying it with context from surrounding steps.
+
+        Args:
+            state: Current agent state
+            failed_step: The step that failed
+            context_steps: Number of steps before/after to include as context
+        """
+        # Get context: steps before and after the failed step
+        all_steps = state.plan
+        failed_idx = next(i for i, s in enumerate(all_steps) if s.id == failed_step.id)
+
+        context_before = all_steps[max(0, failed_idx - context_steps):failed_idx]
+        context_after = all_steps[failed_idx + 1:min(len(all_steps), failed_idx + 1 + context_steps)]
+
+        system_prompt = """You are a plan repair assistant. A specific step in the execution plan has failed.
+
+Your task:
+1. Analyze why the step failed
+2. Fix ONLY this specific step - do not modify other steps
+3. Ensure the fix is compatible with the steps before and after it
+
+Return a JSON object with the fixed step:
+{
+  "id": <same_step_number>,
+  "description": "updated description if needed",
+  "tool": "tool_name",
+  "tool_params": {"param": "value"},
+  "dependencies": []
+}
+
+Available tools:
+1. file_editor - For file operations
+   - view: View entire file or with range {"command": "view", "path": "/path", "view_range": [start, end]}
+   - view_context: View file with context around a line {"command": "view_context", "path": "/path", "center_line": 50, "context_lines": 20}
+   - create: Create new file {"command": "create", "path": "/path", "content": "..."}
+   - str_replace: Replace string {"command": "str_replace", "path": "/path", "old_str": "...", "new_str": "..."}
+   - insert: Insert at line {"command": "insert", "path": "/path", "insert_line": 10, "content": "..."}
+   - delete: Delete file {"command": "delete", "path": "/path"}
+
+2. python_executor - For executing Python code
+   - {"code": "python code to execute"}
+
+3. bash_executor - For executing bash commands
+   - {"command": "bash command"}
+
+CRITICAL:
+- For file_editor insert command, you MUST provide "insert_line" parameter
+- Keep the same step ID
+- Only fix the failed step, don't change the plan structure
+- Analyze the error message carefully"""
+
+        # Build context
+        context = f"""Original request: {state.user_request}
+
+=== EXECUTION HISTORY (last 10 steps) ===
+{state.get_execution_summary(max_steps=10)}
+
+=== CONTEXT: STEPS BEFORE THE FAILED STEP ===
+"""
+        for step in context_before:
+            status_icon = "✅" if step.status == PlanStatus.COMPLETED else "⏳"
+            context += f"{status_icon} Step {step.id}: {step.description}\n"
+            if step.status == PlanStatus.COMPLETED and step.result:
+                context += f"   Result: {step.result[:200]}\n"
+
+        context += f"""
+=== FAILED STEP (FIX THIS ONE) ===
+❌ Step {failed_step.id}: {failed_step.description}
+   Tool: {failed_step.tool}
+   Parameters: {failed_step.tool_params}
+   Error: {failed_step.error}
+"""
+        if failed_step.result:
+            context += f"   Partial output: {failed_step.result[:500]}\n"
+
+        context += "\n=== CONTEXT: STEPS AFTER THE FAILED STEP ===\n"
+        for step in context_after:
+            context += f"⏳ Step {step.id}: {step.description}\n"
+
+        context += f"""
+=== YOUR TASK ===
+Fix Step {failed_step.id} so it will succeed.
+- Analyze what went wrong from the error message
+- Provide corrected tool parameters
+- Keep the same step ID ({failed_step.id})
+- Ensure compatibility with surrounding steps
+
+Return a JSON object with the fixed step."""
+
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=context)
+        ]
+
+        # Use streaming utility with think tag handling
+        _, response_content = await invoke_llm_with_streaming(
+            self.llm,
+            messages,
+            streaming=self.streaming,
+            module="replanner_local_fix",
+            logger=self.logger
+        )
+
+        try:
+            # Extract JSON object (not array)
+            start = response_content.find('{')
+            end = response_content.rfind('}') + 1
+
+            if start == -1 or end == 0:
+                raise ValueError("No JSON object found in response")
+
+            json_str = response_content[start:end]
+            fixed_step_data = json.loads(json_str)
+
+            # Update the failed step in place
+            for step in state.plan:
+                if step.id == failed_step.id:
+                    step.description = fixed_step_data.get("description", step.description)
+                    step.tool = fixed_step_data.get("tool", step.tool)
+                    step.tool_params = fixed_step_data.get("tool_params", step.tool_params)
+                    step.status = PlanStatus.PENDING
+                    step.error = None
+                    print(f"🔧 Fixed Step {step.id}: {step.description}")
+                    break
+
+            # Clear failed steps tracking
+            if failed_step.id in state.failed_steps:
+                state.failed_steps.remove(failed_step.id)
+
+            print(f"✨ Local fix applied to Step {failed_step.id}")
+
+        except Exception as e:
+            self.logger.error(f"Failed to parse local fix response: {str(e)}")
+            # Fallback: try full replan
+            print(f"⚠️ Local fix failed, attempting full replan")
+            return await self._full_replan(state, failed_step)
+
+        state.needs_replan = False
+        return state
+
+    async def _full_replan(
+        self,
+        state: AgentState,
+        first_failed_step: PlanStep
+    ) -> AgentState:
+        """Full replan from the failed step onwards (fallback strategy)."""
         # Get completed steps (keep these as-is)
         completed_steps = [step for step in state.plan if step.status == PlanStatus.COMPLETED and step.id < first_failed_step.id]
 
@@ -128,7 +290,7 @@ Return a JSON array of steps starting from Step {first_failed_step.id}."""
             self.llm,
             messages,
             streaming=self.streaming,
-            module="replanner",
+            module="replanner_full",
             logger=self.logger
         )
 
@@ -154,14 +316,14 @@ Return a JSON array of steps starting from Step {first_failed_step.id}."""
             # Clear failed steps tracking
             state.failed_steps = []
 
-            print(f"\n✨ Replanned from Step {first_failed_step.id} onwards ({len(new_steps_data)} steps)")
+            print(f"\n✨ Full replan from Step {first_failed_step.id} onwards ({len(new_steps_data)} steps)")
 
         except Exception as e:
-            self.logger.error(f"Failed to parse replan response: {str(e)}")
-            # Fallback: just reset the failed step to pending
+            self.logger.error(f"Failed to parse full replan response: {str(e)}")
+            # Last resort: just reset the failed step to pending
             first_failed_step.status = PlanStatus.PENDING
             first_failed_step.error = None
-            print(f"⚠️ Replan parsing failed, retrying failed step as-is")
+            print(f"⚠️ Full replan parsing failed, retrying failed step as-is")
 
         state.needs_replan = False
         return state
