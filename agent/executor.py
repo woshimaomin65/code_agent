@@ -4,7 +4,7 @@ from typing import Dict, Any
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage
 from .state import AgentState, PlanStatus
-from tools import FileEditorTool, PythonExecutorTool, BashExecutorTool
+from tools import FileEditorTool, PythonExecutorTool, BashExecutorTool, PDFReaderTool
 from config.llm_config import LLMConfig
 from utils.logger import invoke_llm_with_streaming
 from utils.json_extractor import JSONExtractor
@@ -19,6 +19,7 @@ class Executor:
             "file_editor": FileEditorTool(),
             "python_executor": PythonExecutorTool(),
             "bash_executor": BashExecutorTool(),
+            "pdf_reader": PDFReaderTool(),
         }
         self.llm = None
         self.streaming = False

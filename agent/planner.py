@@ -44,11 +44,17 @@ Available tools:
    - delete: Delete file {"command": "delete", "path": "/path"}
 2. python_executor - For executing Python code {"code": "python code"}
 3. bash_executor - For executing bash commands {"command": "bash command"}
+4. pdf_reader - For PDF processing and academic paper analysis
+   - get_info: Get PDF information {"command": "get_info", "path": "/path/to/paper.pdf"}
+   - extract_text: Extract text from pages {"command": "extract_text", "path": "/path", "start_page": 0, "end_page": 2}
+   - extract_metadata: Extract paper metadata {"command": "extract_metadata", "path": "/path"}
+   - extract_section: Extract specific section {"command": "extract_section", "path": "/path", "section_name": "Abstract"}
+   - extract_full_markdown: Extract full paper as Markdown {"command": "extract_full_markdown", "path": "/path"}
 
 Return a JSON array of steps, each with:
 - id: step number (starting from 1)
 - description: what to do
-- tool: which tool to use (file_editor, python_executor, bash_executor, or null for thinking steps)
+- tool: which tool to use (file_editor, python_executor, bash_executor, pdf_reader, or null for thinking steps)
 - tool_params: parameters for the tool (or null)
 - dependencies: list of step IDs that must complete first (or empty list)
 
